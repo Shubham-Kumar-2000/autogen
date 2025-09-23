@@ -15,6 +15,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Literal,
     Mapping,
     Optional,
     Sequence,
@@ -93,7 +94,7 @@ openai_init_kwargs = set(inspect.getfullargspec(AsyncOpenAI.__init__).kwonlyargs
 aopenai_init_kwargs = set(inspect.getfullargspec(AsyncAzureOpenAI.__init__).kwonlyargs)
 
 create_kwargs = set(completion_create_params.CompletionCreateParamsBase.__annotations__.keys()) | set(
-    ("timeout", "stream")
+    ("timeout", "stream", "extra_body")
 )
 # Only single choice allowed
 disallowed_create_args = set(["stream", "messages", "function_call", "functions", "n"])
@@ -162,10 +163,15 @@ def type_to_role(message: LLMMessage) -> ChatCompletionRole:
 
 
 def to_oai_type(
-    message: LLMMessage, prepend_name: bool = False, model: str = "unknown", model_family: str = ModelFamily.UNKNOWN
+    message: LLMMessage,
+    prepend_name: bool = False,
+    model: str = "unknown",
+    model_family: str = ModelFamily.UNKNOWN,
+    include_name_in_message: bool = True,
 ) -> Sequence[ChatCompletionMessageParam]:
     context = {
         "prepend_name": prepend_name,
+        "include_name_in_message": include_name_in_message,
     }
     transformers = get_transformer("openai", model, model_family)
 
@@ -265,6 +271,31 @@ def convert_tools(
     return result
 
 
+def convert_tool_choice(tool_choice: Tool | Literal["auto", "required", "none"]) -> Any:
+    """Convert tool_choice parameter to OpenAI API format.
+
+    Args:
+        tool_choice: A single Tool object to force the model to use, "auto" to let the model choose any available tool, "required" to force tool usage, or "none" to disable tool usage.
+
+    Returns:
+        OpenAI API compatible tool_choice value or None if not specified.
+    """
+    if tool_choice == "none":
+        return "none"
+
+    if tool_choice == "auto":
+        return "auto"
+
+    if tool_choice == "required":
+        return "required"
+
+    # Must be a Tool object
+    if isinstance(tool_choice, Tool):
+        return {"type": "function", "function": {"name": tool_choice.schema["name"]}}
+    else:
+        raise ValueError(f"tool_choice must be a Tool object, 'auto', 'required', or 'none', got {type(tool_choice)}")
+
+
 def normalize_name(name: str) -> str:
     """
     LLMs sometimes ask functions while ignoring their own format requirements, this function should be used to replace invalid characters with "_".
@@ -281,6 +312,7 @@ def count_tokens_openai(
     add_name_prefixes: bool = False,
     tools: Sequence[Tool | ToolSchema] = [],
     model_family: str = ModelFamily.UNKNOWN,
+    include_name_in_message: bool = True,
 ) -> int:
     try:
         encoding = tiktoken.encoding_for_model(model)
@@ -294,7 +326,13 @@ def count_tokens_openai(
     # Message tokens.
     for message in messages:
         num_tokens += tokens_per_message
-        oai_message = to_oai_type(message, prepend_name=add_name_prefixes, model=model, model_family=model_family)
+        oai_message = to_oai_type(
+            message,
+            prepend_name=add_name_prefixes,
+            model=model,
+            model_family=model_family,
+            include_name_in_message=include_name_in_message,
+        )
         for oai_message_part in oai_message:
             for key, value in oai_message_part.items():
                 if value is None:
@@ -355,6 +393,17 @@ def count_tokens_openai(
                         elif field == "description":
                             tool_tokens += 2
                             tool_tokens += len(encoding.encode(v["description"]))  # pyright: ignore
+                        elif field == "anyOf":
+                            tool_tokens -= 3
+                            for o in v["anyOf"]:  # type: ignore
+                                tool_tokens += 3
+                                tool_tokens += len(encoding.encode(str(o["type"])))  # pyright: ignore
+                        elif field == "default":
+                            tool_tokens += 2
+                            tool_tokens += len(encoding.encode(json.dumps(v["default"])))
+                        elif field == "title":
+                            tool_tokens += 2
+                            tool_tokens += len(encoding.encode(str(v["title"])))  # pyright: ignore
                         elif field == "enum":
                             tool_tokens -= 3
                             for o in v["enum"]:  # pyright: ignore
@@ -366,7 +415,9 @@ def count_tokens_openai(
                 if len(parameters["properties"]) == 0:  # pyright: ignore
                     tool_tokens -= 2
         num_tokens += tool_tokens
-    num_tokens += 12
+
+    if oai_tools:
+        num_tokens += 12
     return num_tokens
 
 
@@ -387,9 +438,11 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
         model_capabilities: Optional[ModelCapabilities] = None,  # type: ignore
         model_info: Optional[ModelInfo] = None,
         add_name_prefixes: bool = False,
+        include_name_in_message: bool = True,
     ):
         self._client = client
         self._add_name_prefixes = add_name_prefixes
+        self._include_name_in_message = include_name_in_message
         if model_capabilities is None and model_info is None:
             try:
                 self._model_info = _model_info.get_info(create_args["model"])
@@ -449,6 +502,7 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
         self,
         messages: Sequence[LLMMessage],
         tools: Sequence[Tool | ToolSchema],
+        tool_choice: Tool | Literal["auto", "required", "none"],
         json_output: Optional[bool | type[BaseModel]],
         extra_create_args: Mapping[str, Any],
     ) -> CreateParams:
@@ -564,6 +618,7 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
                 prepend_name=self._add_name_prefixes,
                 model=create_args.get("model", "unknown"),
                 model_family=self._model_info["family"],
+                include_name_in_message=self._include_name_in_message,
             )
             for m in messages
         ]
@@ -574,6 +629,29 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
             raise ValueError("Model does not support function calling")
 
         converted_tools = convert_tools(tools)
+
+        # Process tool_choice parameter
+        if isinstance(tool_choice, Tool):
+            if len(tools) == 0:
+                raise ValueError("tool_choice specified but no tools provided")
+
+            # Validate that the tool exists in the provided tools
+            tool_names_available: List[str] = []
+            for tool in tools:
+                if isinstance(tool, Tool):
+                    tool_names_available.append(tool.schema["name"])
+                else:
+                    tool_names_available.append(tool["name"])
+
+            # tool_choice is a single Tool object
+            tool_name = tool_choice.schema["name"]
+            if tool_name not in tool_names_available:
+                raise ValueError(f"tool_choice references '{tool_name}' but it's not in the provided tools")
+
+        if len(converted_tools) > 0:
+            # Convert to OpenAI format and add to create_args
+            converted_tool_choice = convert_tool_choice(tool_choice)
+            create_args["tool_choice"] = converted_tool_choice
 
         return CreateParams(
             messages=oai_messages,
@@ -587,6 +665,7 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
         messages: Sequence[LLMMessage],
         *,
         tools: Sequence[Tool | ToolSchema] = [],
+        tool_choice: Tool | Literal["auto", "required", "none"] = "auto",
         json_output: Optional[bool | type[BaseModel]] = None,
         extra_create_args: Mapping[str, Any] = {},
         cancellation_token: Optional[CancellationToken] = None,
@@ -594,6 +673,7 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
         create_params = self._process_create_args(
             messages,
             tools,
+            tool_choice,
             json_output,
             extra_create_args,
         )
@@ -625,10 +705,12 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
         if create_params.response_format is not None:
             result = cast(ParsedChatCompletion[Any], result)
 
+        # Handle the case where OpenAI API might return None for token counts
+        # even when result.usage is not None
         usage = RequestUsage(
             # TODO backup token counting
-            prompt_tokens=result.usage.prompt_tokens if result.usage is not None else 0,
-            completion_tokens=(result.usage.completion_tokens if result.usage is not None else 0),
+            prompt_tokens=getattr(result.usage, "prompt_tokens", 0) if result.usage is not None else 0,
+            completion_tokens=getattr(result.usage, "completion_tokens", 0) if result.usage is not None else 0,
         )
 
         logger.info(
@@ -736,6 +818,7 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
         messages: Sequence[LLMMessage],
         *,
         tools: Sequence[Tool | ToolSchema] = [],
+        tool_choice: Tool | Literal["auto", "required", "none"] = "auto",
         json_output: Optional[bool | type[BaseModel]] = None,
         extra_create_args: Mapping[str, Any] = {},
         cancellation_token: Optional[CancellationToken] = None,
@@ -767,6 +850,7 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
         create_params = self._process_create_args(
             messages,
             tools,
+            tool_choice,
             json_output,
             extra_create_args,
         )
@@ -876,8 +960,8 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
                     is_reasoning = True
                 thought_deltas.append(reasoning_content)
                 yield reasoning_content
-            elif is_reasoning:
-                # Exit reasoning mode.
+            elif reasoning_content is None and is_reasoning:
+                # Exit reasoning mode only when reasoning_content is None (not when it's an empty string).
                 reasoning_content = "</think>"
                 thought_deltas.append(reasoning_content)
                 is_reasoning = False
@@ -1071,6 +1155,7 @@ class BaseOpenAIChatCompletionClient(ChatCompletionClient):
             add_name_prefixes=self._add_name_prefixes,
             tools=tools,
             model_family=self._model_info["family"],
+            include_name_in_message=self._include_name_in_message,
         )
 
     def remaining_tokens(self, messages: Sequence[LLMMessage], *, tools: Sequence[Tool | ToolSchema] = []) -> int:
@@ -1164,6 +1249,7 @@ class OpenAIChatCompletionClient(BaseOpenAIChatCompletionClient, Component[OpenA
         stop (optional, str | List[str]):
         temperature (optional, float):
         top_p (optional, float):
+        parallel_tool_calls (optional, bool): Whether to allow parallel tool calls. When not set, defaults to server behavior.
         user (optional, str):
         default_headers (optional, dict[str, str]):  Custom headers; useful for authentication or other custom requirements.
         add_name_prefixes (optional, bool): Whether to prepend the `source` value
@@ -1171,6 +1257,9 @@ class OpenAIChatCompletionClient(BaseOpenAIChatCompletionClient, Component[OpenA
             "this is content" becomes "Reviewer said: this is content."
             This can be useful for models that do not support the `name` field in
             message. Defaults to False.
+        include_name_in_message (optional, bool): Whether to include the `name` field
+            in user message parameters sent to the OpenAI API. Defaults to True. Set to False
+            for model providers that don't support the `name` field (e.g., Groq).
         stream_options (optional, dict): Additional options for streaming. Currently only `include_usage` is supported.
 
     Examples:
@@ -1370,6 +1459,10 @@ class OpenAIChatCompletionClient(BaseOpenAIChatCompletionClient, Component[OpenA
         if "add_name_prefixes" in kwargs:
             add_name_prefixes = kwargs["add_name_prefixes"]
 
+        include_name_in_message: bool = True
+        if "include_name_in_message" in kwargs:
+            include_name_in_message = kwargs["include_name_in_message"]
+
         # Special handling for Gemini model.
         assert "model" in copied_args and isinstance(copied_args["model"], str)
         if copied_args["model"].startswith("gemini-"):
@@ -1397,6 +1490,7 @@ class OpenAIChatCompletionClient(BaseOpenAIChatCompletionClient, Component[OpenA
             model_capabilities=model_capabilities,
             model_info=model_info,
             add_name_prefixes=add_name_prefixes,
+            include_name_in_message=include_name_in_message,
         )
 
     def __getstate__(self) -> Dict[str, Any]:
@@ -1496,8 +1590,18 @@ class AzureOpenAIChatCompletionClient(
         stop (optional, str | List[str]):
         temperature (optional, float):
         top_p (optional, float):
+        parallel_tool_calls (optional, bool): Whether to allow parallel tool calls. When not set, defaults to server behavior.
         user (optional, str):
         default_headers (optional, dict[str, str]):  Custom headers; useful for authentication or other custom requirements.
+        add_name_prefixes (optional, bool): Whether to prepend the `source` value
+            to each :class:`~autogen_core.models.UserMessage` content. E.g.,
+            "this is content" becomes "Reviewer said: this is content."
+            This can be useful for models that do not support the `name` field in
+            message. Defaults to False.
+        include_name_in_message (optional, bool): Whether to include the `name` field
+            in user message parameters sent to the OpenAI API. Defaults to True. Set to False
+            for model providers that don't support the `name` field (e.g., Groq).
+        stream_options (optional, dict): Additional options for streaming. Currently only `include_usage` is supported.
 
 
     To use the client, you need to provide your deployment name, Azure Cognitive Services endpoint, and api version.
@@ -1589,6 +1693,10 @@ class AzureOpenAIChatCompletionClient(
         if "add_name_prefixes" in kwargs:
             add_name_prefixes = kwargs["add_name_prefixes"]
 
+        include_name_in_message: bool = True
+        if "include_name_in_message" in kwargs:
+            include_name_in_message = kwargs["include_name_in_message"]
+
         client = _azure_openai_client_from_config(copied_args)
         create_args = _create_args_from_config(copied_args)
         self._raw_config: Dict[str, Any] = copied_args
@@ -1598,6 +1706,7 @@ class AzureOpenAIChatCompletionClient(
             model_capabilities=model_capabilities,
             model_info=model_info,
             add_name_prefixes=add_name_prefixes,
+            include_name_in_message=include_name_in_message,
         )
 
     def __getstate__(self) -> Dict[str, Any]:
